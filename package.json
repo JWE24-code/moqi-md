@@ -1,6 +1,6 @@
 {
   "name": "moqi-md",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read markdown files in the terminal, drawn the way Moqi draws its transcript.",
   "type": "module",
   "license": "MIT",
