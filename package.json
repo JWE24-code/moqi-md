@@ -19,6 +19,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test tests/*.test.ts",
+    "coverage": "node --test --experimental-test-coverage --test-reporter=lcov --test-reporter-destination=lcov.info --test-reporter=spec --test-reporter-destination=stdout tests/*.test.ts",
     "preview": "node src/cli.ts examples/showcase.md",
     "prepare": "npm run build"
   },
