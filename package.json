@@ -1,0 +1,29 @@
+{
+  "name": "moqi-md",
+  "version": "0.1.0",
+  "description": "Read markdown files in the terminal, drawn the way Moqi draws its transcript.",
+  "type": "module",
+  "license": "MIT",
+  "author": "JWE24-code <292770342+JWE24-code@users.noreply.github.com>",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "moqi-md": "bin/moqi-md.mjs"
+  },
+  "files": [
+    "bin/*.mjs",
+    "lib/**/*.js"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "preview": "node src/cli.ts examples/showcase.md",
+    "prepare": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
