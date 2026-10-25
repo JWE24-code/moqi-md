@@ -71,12 +71,13 @@ export interface RenderOptions {
 
 // ── Line classifiers ─────────────────────────────────────────────────────────
 
-const FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/
-const HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$/
+// Patterns match only a line's fixed-shape prefix; the rest is sliced off as a
+// string. A trailing `(.*)$` next to another quantifier backtracks.
+const FENCE = /^( {0,3})(`{3,}|~{3,})/
+const HEADING_OPEN = /^ {0,3}(#{1,6})(?=[ \t]|$)/
 const RULE = /^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/
 const QUOTE = /^ {0,3}>[ ]?(.*)$/
-const LIST = /^( {0,3})([-*+]|\d{1,9}[.)])([ \t]+|$)(.*)$/
-const TABLE_SEPARATOR = /^ {0,3}\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$/
+const LIST_OPEN = /^( {0,3})([-*+]|\d{1,9}[.)])(?=[ \t]|$)/
 const REF_DEF = /^ {0,3}\[([^\]^][^\]]*)\]:[ \t]*<?([^\s>]+)>?(?:[ \t]+["'(].*["')])?[ \t]*$/
 const HTML_BLOCK = /^ {0,3}<\/?(?:[A-Za-z][A-Za-z0-9-]*)(?:\s|\/?>|$)/
 const BLANK = /^\s*$/
@@ -85,11 +86,51 @@ function isBlank(line: string): boolean {
   return BLANK.test(line)
 }
 
+/** An ATX heading's level and text, closing `#` run removed. */
+function atxHeading(line: string): { level: number; text: string } | undefined {
+  const open = HEADING_OPEN.exec(line)
+  if (open === null) return undefined
+  let text = line.slice(open[0].length).trim()
+  let end = text.length
+  while (end > 0 && text[end - 1] === '#') end -= 1
+  // A closing run counts only when it stands apart from the text (or is all there is).
+  if (end === 0) text = ''
+  else if (end < text.length && (text[end - 1] === ' ' || text[end - 1] === '\t')) text = text.slice(0, end).trimEnd()
+  return { level: (open[1] ?? '#').length, text }
+}
+
+/** A list item's marker line: indent, marker, spaces after it, and its content. */
+interface ListMarker {
+  indent: number
+  marker: string
+  gap: number
+  content: string
+}
+
+function listMarker(line: string): ListMarker | undefined {
+  if (RULE.test(line)) return undefined
+  const open = LIST_OPEN.exec(line)
+  if (open === null) return undefined
+  const rest = line.slice(open[0].length)
+  const content = rest.trimStart()
+  return { indent: (open[1] ?? '').length, marker: open[2] ?? '-', gap: rest.length - content.length, content }
+}
+
+/** A table's delimiter row: `| :--- | ---: |`, pipes at the edges optional. */
+function isTableSeparator(line: string): boolean {
+  if (indentOf(line) > 3) return false
+  let text = line.trim()
+  if (text.startsWith('|')) text = text.slice(1)
+  if (text.endsWith('|')) text = text.slice(0, -1)
+  if (!text.includes('-')) return false
+  return text.split('|').every((cell) => /^:?-+:?$/.test(cell.trim()))
+}
+
 /** Whether `line` would start a block that interrupts a paragraph. */
 function interrupts(line: string): boolean {
   return (
     FENCE.test(line) ||
-    HEADING.test(line) ||
+    atxHeading(line) !== undefined ||
     RULE.test(line) ||
     QUOTE.test(line) ||
     HTML_BLOCK.test(line) ||
@@ -206,9 +247,10 @@ class Parser {
     if (end === -1) return undefined
     const entries: [string, string][] = []
     for (const line of lines.slice(1, end)) {
-      const pair = /^([\w.-]+):\s*(.*)$/.exec(line)
-      if (pair !== null) {
-        entries.push([pair[1] ?? '', pair[2] ?? ''])
+      const colon = line.indexOf(':')
+      const key = colon === -1 ? '' : line.slice(0, colon)
+      if (/^[\w.-]+$/.test(key)) {
+        entries.push([key, line.slice(colon + 1).trim()])
         continue
       }
       // A nested value or list item belongs to the key above it.
@@ -221,23 +263,25 @@ class Parser {
   }
 
   private fence(lines: readonly string[], index: number): Step | undefined {
-    const open = FENCE.exec(lines[index] ?? '')
+    const line = lines[index] ?? ''
+    const open = FENCE.exec(line)
     if (open === null) return undefined
     const indent = (open[1] ?? '').length
     const marker = open[2] ?? '```'
-    const info = (open[3] ?? '').trim()
+    const info = line.slice(open[0].length).trim()
     // A backtick fence's info string may not itself contain a backtick.
     if (marker.startsWith('`') && info.includes('`')) return undefined
     const body: string[] = []
     let next = index + 1
     while (next < lines.length) {
-      const line = lines[next] ?? ''
-      const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line)
-      if (close !== null && (close[1] ?? '')[0] === marker[0] && (close[1] ?? '').length >= marker.length) {
+      const candidate = lines[next] ?? ''
+      const close = FENCE.exec(candidate)
+      const closes = close !== null && candidate.slice(close[0].length).trim() === ''
+      if (closes && (close[2] ?? '')[0] === marker[0] && (close[2] ?? '').length >= marker.length) {
         next += 1
         break
       }
-      body.push(dedent(line, indent))
+      body.push(dedent(candidate, indent))
       next += 1
     }
     return { block: { kind: 'code', info, lines: body }, next }
@@ -254,9 +298,9 @@ class Parser {
   }
 
   private heading(lines: readonly string[], index: number): Step | undefined {
-    const match = HEADING.exec(lines[index] ?? '')
-    if (match === null) return undefined
-    return { block: { kind: 'heading', level: (match[1] ?? '#').length, text: (match[2] ?? '').trim() }, next: index + 1 }
+    const heading = atxHeading(lines[index] ?? '')
+    if (heading === undefined) return undefined
+    return { block: { kind: 'heading', level: heading.level, text: heading.text }, next: index + 1 }
   }
 
   private rule(lines: readonly string[], index: number): Step | undefined {
@@ -290,26 +334,27 @@ class Parser {
   }
 
   private list(lines: readonly string[], index: number): Step | undefined {
-    const first = LIST.exec(lines[index] ?? '')
-    if (first === null || RULE.test(lines[index] ?? '')) return undefined
-    const ordered = /\d/.test(first[2] ?? '')
-    const delimiter = (first[2] ?? '-').slice(-1)
-    const start = ordered ? Number.parseInt(first[2] ?? '1', 10) : 1
+    const first = listMarker(lines[index] ?? '')
+    if (first === undefined) return undefined
+    const ordered = /\d/.test(first.marker)
+    const delimiter = first.marker.slice(-1)
+    const start = ordered ? Number.parseInt(first.marker, 10) : 1
+    const sameList = (item: ListMarker | undefined): item is ListMarker =>
+      item !== undefined && /\d/.test(item.marker) === ordered && item.marker.slice(-1) === delimiter
     const items: ListItem[] = []
     let loose = false
     let next = index
 
     while (next < lines.length) {
-      const match = LIST.exec(lines[next] ?? '')
-      if (match === null || RULE.test(lines[next] ?? '')) break
-      if (/\d/.test(match[2] ?? '') !== ordered || (match[2] ?? '').slice(-1) !== delimiter) break
+      const match = listMarker(lines[next] ?? '')
+      if (!sameList(match)) break
 
-      const markerIndent = (match[1] ?? '').length + (match[2] ?? '').length
-      const gap = (match[3] ?? '').length
+      const markerIndent = match.indent + match.marker.length
+      const gap = match.gap
       // Content starts after the marker and its spaces; five or more spaces
       // mean the content is indented code, so the item takes just one.
       const contentIndent = markerIndent + (gap === 0 || gap > 4 ? 1 : gap)
-      const body: string[] = [match[4] ?? '']
+      const body: string[] = [match.content]
       next += 1
 
       while (next < lines.length) {
@@ -325,7 +370,7 @@ class Parser {
           continue
         }
         const previousBlank = isBlank(body.at(-1) ?? '')
-        if (!previousBlank && !interrupts(line) && !LIST.test(line)) {
+        if (!previousBlank && !interrupts(line) && listMarker(line) === undefined) {
           body.push(line.trim())
           next += 1
           continue
@@ -339,12 +384,7 @@ class Parser {
         body.pop()
         trailing += 1
       }
-      const following = LIST.exec(lines[next] ?? '')
-      const continues =
-        following !== null &&
-        !RULE.test(lines[next] ?? '') &&
-        /\d/.test(following[2] ?? '') === ordered &&
-        (following[2] ?? '').slice(-1) === delimiter
+      const continues = sameList(listMarker(lines[next] ?? ''))
       if (trailing > 0 && continues) loose = true
       if (trailing > 0 && !continues) next -= trailing
       // A blank line between two blocks inside one item also loosens the list.
@@ -365,7 +405,7 @@ class Parser {
   private table(lines: readonly string[], index: number): Step | undefined {
     const head = lines[index] ?? ''
     const separator = lines[index + 1] ?? ''
-    if (!head.includes('|') || !TABLE_SEPARATOR.test(separator) || !separator.includes('-')) return undefined
+    if (!head.includes('|') || !isTableSeparator(separator)) return undefined
     const header = splitCells(head)
     const align = splitCells(separator).map((cell): Align => {
       const left = cell.startsWith(':')
@@ -432,7 +472,7 @@ class Parser {
         return { block: { kind: 'heading', level: line.trim().startsWith('=') ? 1 : 2, text: joinLines(parts) }, next: next + 1 }
       }
       if (isBlank(line) || interrupts(line)) break
-      if (line.includes('|') && TABLE_SEPARATOR.test(lines[next + 1] ?? '')) break
+      if (line.includes('|') && isTableSeparator(lines[next + 1] ?? '')) break
       parts.push(line)
       next += 1
     }
@@ -447,7 +487,7 @@ function joinLines(parts: readonly string[]): string {
       const last = index === parts.length - 1
       const trimmed = line.trim()
       if (last) return trimmed
-      if (/ {2,}$/.test(line) || (trimmed.endsWith('\\') && !trimmed.endsWith('\\\\'))) {
+      if (line.endsWith('  ') || (trimmed.endsWith('\\') && !trimmed.endsWith('\\\\'))) {
         return `${trimmed.replace(/\\$/, '')}<br>`
       }
       return trimmed
