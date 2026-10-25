@@ -241,8 +241,21 @@ function parseLink(rest: string, context: InlineContext): { label: string; href:
   const label = rest.slice(1, close)
   const tail = rest.slice(close + 1)
 
-  const inline = /^\(\s*<?([^)\s>]*)>?(?:\s+["'(][^)]*["')])?\s*\)/.exec(tail)
-  if (inline !== null) return { label, href: inline[1] ?? '', length: close + 1 + inline[0].length }
+  if (tail.startsWith('(')) {
+    // `(target "title")`: the target is the first word, angle brackets optional.
+    const end = tail.indexOf(')')
+    if (end !== -1) {
+      const inside = tail.slice(1, end).trim()
+      const target = inside.split(/\s/)[0] ?? ''
+      const title = inside.slice(target.length).trim()
+      // Anything after the target must be a quoted title; a target with spaces is no link.
+      const quoted = title === '' || (title.length >= 2 && `"'(`.includes(title[0] ?? '') && `"')`.includes(title.at(-1) ?? ''))
+      if (quoted) {
+        const href = target.startsWith('<') && target.endsWith('>') ? target.slice(1, -1) : target
+        return { label, href, length: close + 1 + end + 1 }
+      }
+    }
+  }
 
   const full = /^\[([^\]]*)\]/.exec(tail)
   const key = (full === null || full[1] === '' ? label : (full[1] ?? '')).toLowerCase().trim()
