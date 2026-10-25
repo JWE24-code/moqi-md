@@ -30,6 +30,8 @@ the document's structure.
 
 ```sh
 moqi-md notes.md             # view a file
+moqi-md a.md b.md c.md       # one tab per file
+moqi-md docs/                # a tab per markdown file in a folder, README first
 moqi-md                      # view ./README.md
 cat CHANGELOG.md | moqi-md   # view stdin
 moqi-md -p doc.md | less -R  # render once (automatic when piped; plain text unless --color)
@@ -44,10 +46,19 @@ moqi-md -p doc.md | less -R  # render once (automatic when piped; plain text unl
 | `]` `[` | next / previous section |
 | `t` | outline — jump to any heading |
 | `/` `n` `N` | incremental smart-case search, next, previous |
+| `alt+n` `alt+p` | next / previous tab (or click a tab) |
+| `alt+1`…`alt+9` | jump straight to a tab |
+| `ctrl+w` | close the tab; closing the last one quits |
 | `e` | open in `$EDITOR` near the current section |
 | `r` | reload (it also reloads on its own when the file changes) |
 | `?` | key list |
 | `q` | quit |
+
+With more than one file open, a tab bar appears under the header, drawn like
+Moqi's session strip. Each tab keeps its own scroll position and search, and a
+gold `●` marks a tab whose file changed while you were reading another one.
+Piped or with `--print`, several files print one after another, each under its
+name.
 
 Options: `--width <cols>` (reading column, default 100), `--theme <name>`,
 `--list-themes`, `--color`, `--no-mouse`, `--no-watch`.
