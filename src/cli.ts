@@ -18,7 +18,7 @@ import { runPager, type PagerSource } from './pager.ts'
 import { stripAnsi } from './vendor/text.ts'
 import { applyTheme, listThemes, activeTheme } from './vendor/theme.ts'
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 
 const USAGE = `moqi-md ${VERSION} — markdown in the terminal, Moqi style
 
