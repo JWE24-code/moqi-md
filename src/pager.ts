@@ -71,6 +71,46 @@ type Mode = 'read' | 'search' | 'outline' | 'help'
 
 const SEPARATOR = '  ·  '
 
+/**
+ * One open document: its text and everything the reader did to it, so a tab
+ * comes back exactly where it was left.
+ */
+interface Doc {
+  text: string
+  /** Absolute path; absent for stdin, which cannot reload or be edited. */
+  path: string | undefined
+  rendered: Rendered
+  /** The width `rendered` was laid out at; a mismatch means re-render. */
+  renderedWidth: number
+  top: number
+  query: string
+  matches: Match[]
+  current: number
+  /** Changed on disk while another tab was showing. */
+  changed: boolean
+  watcher?: FSWatcher
+  reloadTimer?: ReturnType<typeof setTimeout>
+}
+
+function openDoc(source: PagerSource): Doc {
+  return {
+    text: source.text,
+    path: source.path === undefined ? undefined : resolve(source.path),
+    rendered: { lines: [], headings: [] },
+    renderedWidth: 0,
+    top: 0,
+    query: '',
+    matches: [],
+    current: -1,
+    changed: false,
+  }
+}
+
+/** A tab's label: the file name, or `stdin`. */
+function docName(doc: Doc): string {
+  return doc.path === undefined ? 'stdin' : basename(doc.path)
+}
+
 const HELP: [string, string][] = [
   ['j k  ↓ ↑', 'scroll a line'],
   ['space  b', 'page down / up'],
@@ -79,6 +119,9 @@ const HELP: [string, string][] = [
   [']  [', 'next / previous section'],
   ['t', 'outline'],
   ['/  n  N', 'search, next, previous'],
+  ['alt+n  alt+p', 'next / previous tab'],
+  ['alt+1…9', 'jump to a tab'],
+  ['ctrl+w', 'close the tab'],
   ['e', 'edit in $EDITOR'],
   ['r', 'reload'],
   ['q', 'quit'],
@@ -105,32 +148,27 @@ class Painter {
   }
 }
 
-/** Run the viewer until the user quits. */
-export function runPager(source: PagerSource, options: PagerOptions): Promise<void> {
+/** Run the viewer over one tab per source until the user quits. */
+export function runPager(sources: readonly PagerSource[], options: PagerOptions): Promise<void> {
   return new Promise((done) => {
-    new Pager(source, options, done).start()
+    new Pager(sources, options, done).start()
   })
 }
 
 class Pager {
-  private text: string
-  private readonly path: string | undefined
-  private rendered: Rendered = { lines: [], headings: [] }
+  private readonly docs: Doc[]
+  private active = 0
+  /** Column spans of the drawn tab cells, for clicks on the bar. */
+  private tabCells: { index: number; start: number; end: number }[] = []
   private columns = 80
   private rows = 24
-  private top = 0
   private mode: Mode = 'read'
-  private query = ''
   private queryBefore = ''
   private topBefore = 0
-  private matches: Match[] = []
-  private current = -1
   private outlineIndex = 0
   private message = ''
   private messageIsError = false
   private messageTimer: ReturnType<typeof setTimeout> | undefined
-  private watcher: FSWatcher | undefined
-  private reloadTimer: ReturnType<typeof setTimeout> | undefined
   private readonly painter = new Painter()
   private readonly decode = createDecoder((key) => {
     this.onKey(key)
@@ -150,11 +188,61 @@ class Pager {
   private readonly options: PagerOptions
   private readonly done: () => void
 
-  constructor(source: PagerSource, options: PagerOptions, done: () => void) {
+  constructor(sources: readonly PagerSource[], options: PagerOptions, done: () => void) {
     this.options = options
     this.done = done
-    this.text = source.text
-    this.path = source.path === undefined ? undefined : resolve(source.path)
+    this.docs = sources.map(openDoc)
+  }
+
+  // The rest of the viewer reads and writes the active tab through these, so
+  // scrolling, search, and the outline need not know tabs exist.
+  private get doc(): Doc {
+    return this.docs[this.active] ?? (this.docs[0] as Doc)
+  }
+  private get path(): string | undefined {
+    return this.doc.path
+  }
+  private get text(): string {
+    return this.doc.text
+  }
+  private set text(value: string) {
+    this.doc.text = value
+  }
+  private get rendered(): Rendered {
+    return this.doc.rendered
+  }
+  private set rendered(value: Rendered) {
+    this.doc.rendered = value
+  }
+  private get renderedWidth(): number {
+    return this.doc.renderedWidth
+  }
+  private set renderedWidth(value: number) {
+    this.doc.renderedWidth = value
+  }
+  private get top(): number {
+    return this.doc.top
+  }
+  private set top(value: number) {
+    this.doc.top = value
+  }
+  private get query(): string {
+    return this.doc.query
+  }
+  private set query(value: string) {
+    this.doc.query = value
+  }
+  private get matches(): Match[] {
+    return this.doc.matches
+  }
+  private set matches(value: Match[]) {
+    this.doc.matches = value
+  }
+  private get current(): number {
+    return this.doc.current
+  }
+  private set current(value: number) {
+    this.doc.current = value
   }
 
   start(): void {
@@ -165,7 +253,7 @@ class Pager {
     process.on('exit', () => {
       this.detach()
     })
-    if (this.options.watch) this.startWatching()
+    if (this.options.watch) for (const doc of this.docs) this.startWatching(doc)
     this.layout(true)
   }
 
@@ -187,13 +275,15 @@ class Pager {
     this.detach()
     this.stopped = true
     this.decode.dispose()
-    this.watcher?.close()
+    for (const doc of this.docs) {
+      doc.watcher?.close()
+      clearTimeout(doc.reloadTimer)
+    }
     this.options.input.off('data', this.onData)
     this.options.input.pause()
     process.stdout.off('resize', this.onResize)
     process.off('SIGCONT', this.onCont)
     clearTimeout(this.messageTimer)
-    clearTimeout(this.reloadTimer)
     this.done()
   }
 
@@ -220,10 +310,15 @@ class Pager {
     return Math.max(Math.floor((this.columns - this.contentWidth) / 2), 2)
   }
 
-  /** Rows the document gets: header and blank above, blank and footer below. */
+  /** Whether the tab bar is drawn: only with more than one tab, as in Moqi. */
+  private get showTabs(): boolean {
+    return this.docs.length > 1
+  }
+
+  /** Rows the document gets: header, tabs, and blank above; blank and footer below. */
   private get bodyHeight(): number {
     const composer = this.mode === 'search' ? 3 : 1
-    return Math.max(this.rows - 3 - composer, 1)
+    return Math.max(this.rows - 3 - composer - (this.showTabs ? 1 : 0), 1)
   }
 
   private get maxTop(): number {
@@ -249,7 +344,28 @@ class Pager {
     this.scrollTo(this.top)
   }
 
-  private renderedWidth = 0
+  // ── Tabs ─────────────────────────────────────────────────────────────────
+
+  private switchTo(index: number): void {
+    if (index < 0 || index >= this.docs.length) return
+    this.active = index
+    this.mode = 'read'
+    this.doc.changed = false
+    // A tab laid out at another width (the terminal was resized while it was
+    // hidden, or the file changed) is re-rendered on arrival.
+    this.layout(false)
+  }
+
+  private closeTab(): void {
+    if (this.docs.length === 1) {
+      this.quit()
+      return
+    }
+    const [closed] = this.docs.splice(this.active, 1)
+    closed?.watcher?.close()
+    clearTimeout(closed?.reloadTimer)
+    this.switchTo(Math.min(this.active, this.docs.length - 1))
+  }
 
   // ── Movement ─────────────────────────────────────────────────────────────
 
@@ -338,40 +454,50 @@ class Pager {
 
   // ── Reload ───────────────────────────────────────────────────────────────
 
-  private startWatching(): void {
-    if (this.path === undefined) return
-    const file = basename(this.path)
+  private startWatching(doc: Doc): void {
+    const path = doc.path
+    if (path === undefined) return
+    const file = basename(path)
     try {
       // Watch the directory: editors save by renaming over the file, which
       // silently ends a watch held on the file itself.
-      this.watcher = watch(dirname(this.path), (_event, name) => {
+      doc.watcher = watch(dirname(path), (_event, name) => {
         if (name !== null && name !== file) return
-        clearTimeout(this.reloadTimer)
-        this.reloadTimer = setTimeout(() => {
-          this.reload(false)
+        clearTimeout(doc.reloadTimer)
+        doc.reloadTimer = setTimeout(() => {
+          this.reload(doc, false)
         }, 80)
       })
     } catch {
-      this.watcher = undefined
+      doc.watcher = undefined
     }
   }
 
-  private reload(manual: boolean): void {
-    if (this.path === undefined) {
+  private reload(doc: Doc, manual: boolean): void {
+    if (doc.path === undefined) {
       if (manual) this.flash('stdin cannot be reloaded', true)
       return
     }
     let text: string
     try {
-      text = readFileSync(this.path, 'utf8')
+      text = readFileSync(doc.path, 'utf8')
     } catch {
       // Mid-save the file can briefly be missing; the next event brings it back.
       if (manual) this.flash('could not read the file', true)
       return
     }
-    if (text === this.text && !manual) return
-    this.text = text
+    if (text === doc.text && !manual) return
+    doc.text = text
+    // A hidden tab only takes the text and raises its mark; it is laid out
+    // again when it is shown.
+    if (doc !== this.doc) {
+      doc.renderedWidth = 0
+      doc.changed = true
+      this.draw()
+      return
+    }
     this.rendered = renderDocument(this.text, { width: this.contentWidth, hyperlinks: true })
+    this.renderedWidth = this.contentWidth
     this.refreshMatches(false)
     this.flash('reloaded', false)
     this.scrollTo(this.top)
@@ -389,7 +515,7 @@ class Pager {
       const [command = 'vi', ...rest] = editor.split(' ')
       spawnSync(command, [...rest, `+${String(line)}`, path], { stdio: 'inherit' })
     })
-    this.reload(true)
+    this.reload(this.doc, true)
   }
 
   /** The source line of the current section heading, so the editor opens near it. */
@@ -540,13 +666,34 @@ class Pager {
         this.draw()
         return
       case 'r':
-        this.reload(true)
+        this.reload(this.doc, true)
         return
+      case 'alt+n':
+        this.switchTo((this.active + 1) % this.docs.length)
+        return
+      case 'alt+p':
+        this.switchTo((this.active - 1 + this.docs.length) % this.docs.length)
+        return
+      case 'ctrl+w':
+        this.closeTab()
+        return
+      case 'click': {
+        const row = key.mouse?.row ?? -1
+        const column = key.mouse?.column ?? -1
+        const cell = this.showTabs && row === 1 ? this.tabCells.find((tab) => column >= tab.start && column < tab.end) : undefined
+        if (cell !== undefined) this.switchTo(cell.index)
+        return
+      }
       case 'e':
         this.edit()
         return
       case 'ctrl+l':
         this.layout(true)
+        return
+      default: {
+        const jump = /^alt\+([1-9])$/.exec(key.name)
+        if (jump !== null) this.switchTo(Number(jump[1]) - 1)
+      }
     }
   }
 
@@ -630,7 +777,9 @@ class Pager {
 
   private draw(): void {
     if (this.stopped) return
-    const frame: string[] = [this.header(), '']
+    const frame: string[] = [this.header()]
+    if (this.showTabs) frame.push(this.tabBar())
+    frame.push('')
     const body = this.body()
     frame.push(...body)
     if (this.mode === 'search') frame.push(...this.composer())
@@ -640,6 +789,36 @@ class Pager {
     if (this.mode === 'outline') lines = this.overlay(frame, this.outlineBox())
     if (this.mode === 'help') lines = this.overlay(frame, this.helpBox())
     this.painter.paint(lines.map((line) => truncate(line, this.columns)))
+  }
+
+  /**
+   * The tab bar, drawn the way Moqi draws its session strip: a numbered cell
+   * per tab, `●` on one that changed while hidden, the active one selected.
+   */
+  private tabBar(): string {
+    const cells = this.docs.map((doc, index) => {
+      const mark = doc.changed ? style('●', { fg: colGold }) : muted('·')
+      const body = `${mark} ${truncate(`${String(index + 1)} ${docName(doc)}`, 22)}`
+      return { index, text: index === this.active ? selected(` ${body} `) : muted(` ${body} `) }
+    })
+    // Too many to fit: show a window around the active tab and count the rest.
+    let first = 0
+    let last = cells.length
+    const width = (from: number, to: number): number =>
+      cells.slice(from, to).reduce((sum, cell) => sum + displayWidth(cell.text) + 1, 0) + 8
+    while (width(first, last) > this.columns && last - first > 1) {
+      if (this.active - first > last - 1 - this.active) first += 1
+      else last -= 1
+    }
+    this.tabCells = []
+    let column = 1
+    const shown = cells.slice(first, last).map((cell) => {
+      this.tabCells.push({ index: cell.index, start: column, end: column + displayWidth(cell.text) })
+      column += displayWidth(cell.text) + 1
+      return cell.text
+    })
+    const hidden = cells.length - shown.length
+    return ` ${shown.join(muted('│'))}${hidden > 0 ? muted(`  +${String(hidden)}`) : ''}`
   }
 
   /** `◆ moqi-md  file` on the left, its folder on the right. */

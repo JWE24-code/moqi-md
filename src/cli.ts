@@ -8,13 +8,13 @@
  * @module
  */
 
-import { openSync, readFileSync, existsSync } from 'node:fs'
+import { openSync, readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { ReadStream } from 'node:tty'
 
 import { renderDocument } from './markdown.ts'
-import { runPager } from './pager.ts'
+import { runPager, type PagerSource } from './pager.ts'
 import { stripAnsi } from './vendor/text.ts'
 import { applyTheme, listThemes, activeTheme } from './vendor/theme.ts'
 
@@ -23,7 +23,8 @@ const VERSION = '0.1.0'
 const USAGE = `moqi-md ${VERSION} — markdown in the terminal, Moqi style
 
 usage
-  moqi-md [options] [file]      view a file (README.md when none is given)
+  moqi-md [options] [file…]     view files, one tab each (README.md when none)
+  moqi-md docs/                 a tab per markdown file in a folder
   cat notes.md | moqi-md        view stdin
   moqi-md -p file > out.txt     render once and print
 
@@ -41,7 +42,7 @@ options
 keys in the viewer: ? lists them`
 
 interface Args {
-  file: string | undefined
+  files: string[]
   print: boolean
   width: number
   theme: string | undefined
@@ -54,7 +55,7 @@ interface Args {
 class UsageError extends Error {}
 
 function parseArgs(argv: readonly string[]): Args | 'help' | 'version' {
-  const args: Args = { file: undefined, print: false, width: 100, theme: undefined, listThemes: false, color: false, mouse: true, watch: true }
+  const args: Args = { files: [], print: false, width: 100, theme: undefined, listThemes: false, color: false, mouse: true, watch: true }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index] ?? ''
     const value = (): string => {
@@ -99,8 +100,7 @@ function parseArgs(argv: readonly string[]): Args | 'help' | 'version' {
         break
       default:
         if (arg.startsWith('-') && arg !== '-') throw new UsageError(`unknown option ${arg}`)
-        if (args.file !== undefined) throw new UsageError('one file at a time')
-        args.file = arg
+        args.files.push(arg)
     }
   }
   return args
@@ -132,6 +132,54 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
+/** Markdown files in a folder, README first, then by name. */
+function markdownIn(folder: string): string[] {
+  const names = readdirSync(folder)
+    .filter((name) => /\.(md|markdown|mdx)$/i.test(name))
+    .sort((a, b) => {
+      const readme = (name: string): number => (/^readme\./i.test(name) ? 0 : 1)
+      return readme(a) - readme(b) || a.localeCompare(b)
+    })
+  return names.map((name) => join(folder, name))
+}
+
+/** Read every named file (folders expanded, duplicates dropped), or stdin, or the README. */
+async function gatherSources(files: readonly string[]): Promise<PagerSource[]> {
+  if (files.length === 0) {
+    if (!process.stdin.isTTY) return [{ text: await readStdin() }]
+    if (existsSync('README.md')) files = ['README.md']
+    else throw new UsageError(`no file given and no README.md here\n\n${USAGE}`)
+  }
+  const sources: PagerSource[] = []
+  const seen = new Set<string>()
+  for (const file of files) {
+    if (file === '-') {
+      if (seen.has('-')) continue
+      seen.add('-')
+      sources.push({ text: await readStdin() })
+      continue
+    }
+    let paths: string[]
+    try {
+      paths = statSync(file).isDirectory() ? markdownIn(file) : [file]
+    } catch (error) {
+      throw new UsageError(`cannot read ${file}: ${(error as Error).message}`)
+    }
+    if (paths.length === 0) throw new UsageError(`no markdown files in ${file}`)
+    for (const path of paths) {
+      const key = resolve(path)
+      if (seen.has(key)) continue
+      seen.add(key)
+      try {
+        sources.push({ text: readFileSync(path, 'utf8'), path })
+      } catch (error) {
+        throw new UsageError(`cannot read ${basename(path)}: ${(error as Error).message}`)
+      }
+    }
+  }
+  return sources
+}
+
 async function main(): Promise<number> {
   let parsed: ReturnType<typeof parseArgs>
   try {
@@ -161,33 +209,29 @@ async function main(): Promise<number> {
     return 0
   }
 
-  // Where the document comes from: a named file, stdin, or the README here.
-  let text: string
-  let path: string | undefined
-  const fromStdin = args.file === '-' || (args.file === undefined && !process.stdin.isTTY)
-  if (fromStdin) {
-    text = await readStdin()
-  } else {
-    path = args.file ?? (existsSync('README.md') ? 'README.md' : undefined)
-    if (path === undefined) {
-      process.stderr.write(`moqi-md: no file given and no README.md here\n\n${USAGE}\n`)
-      return 2
-    }
-    try {
-      text = readFileSync(path, 'utf8')
-    } catch (error) {
-      process.stderr.write(`moqi-md: cannot read ${path}: ${(error as Error).message}\n`)
-      return 1
-    }
+  // Where the documents come from: named files and folders, stdin, or the README here.
+  let sources: PagerSource[]
+  try {
+    sources = await gatherSources(args.files)
+  } catch (error) {
+    if (!(error instanceof UsageError)) throw error
+    process.stderr.write(`moqi-md: ${error.message}\n`)
+    return error.message.startsWith('no file given') ? 2 : 1
   }
 
   if (args.print || !process.stdout.isTTY) {
     const terminal = process.stdout.isTTY
     const width = Math.min(terminal ? process.stdout.columns - 2 : 80, args.width)
     const plain = !terminal && !args.color
-    const { lines } = renderDocument(text, { width, hyperlinks: terminal, plain })
-    const output = lines.map((line) => (plain ? stripAnsi(line) : line).trimEnd()).join('\n')
-    process.stdout.write(`${output}\n`)
+    const parts = sources.map((source) => {
+      const { lines } = renderDocument(source.text, { width, hyperlinks: terminal, plain })
+      const body = lines.map((line) => (plain ? stripAnsi(line) : line).trimEnd()).join('\n')
+      // Several files print one after another, each under its name.
+      if (sources.length === 1) return body
+      const name = source.path === undefined ? 'stdin' : source.path
+      return `${plain ? `◆ ${name}` : `\x1b[1m◆ ${name}\x1b[0m`}\n\n${body}`
+    })
+    process.stdout.write(`${parts.join('\n\n')}\n`)
     return 0
   }
 
@@ -203,7 +247,7 @@ async function main(): Promise<number> {
       return 1
     }
   }
-  await runPager(path === undefined ? { text } : { text, path }, {
+  await runPager(sources, {
     maxWidth: args.width,
     mouse: args.mouse,
     watch: args.watch,
